@@ -9,7 +9,10 @@ import sys
 from pathlib import Path
 from urllib.parse import urlparse
 
+import boto3
 import duckdb
+from boto3.s3.transfer import TransferConfig
+from botocore.config import Config
 
 
 def require_env(name: str) -> str:
@@ -20,7 +23,7 @@ def require_env(name: str) -> str:
     return value
 
 
-def parse_endpoint(endpoint: str) -> tuple[str, bool]:
+def parse_duckdb_endpoint(endpoint: str) -> tuple[str, bool]:
     normalized = endpoint if "://" in endpoint else f"https://{endpoint}"
     parsed = urlparse(normalized)
     host = parsed.hostname
@@ -32,6 +35,18 @@ def parse_endpoint(endpoint: str) -> tuple[str, bool]:
 
     use_ssl = parsed.scheme != "http"
     return host, use_ssl
+
+
+def parse_boto_endpoint(endpoint: str) -> str:
+    normalized = endpoint if "://" in endpoint else f"https://{endpoint}"
+    parsed = urlparse(normalized)
+    if not parsed.hostname:
+        raise ValueError(f"无法解析 MINIO_ENDPOINT: {endpoint}")
+
+    endpoint_url = f"{parsed.scheme}://{parsed.hostname}"
+    if parsed.port:
+        endpoint_url = f"{endpoint_url}:{parsed.port}"
+    return endpoint_url
 
 
 def sql_literal(value: str) -> str:
@@ -46,7 +61,7 @@ def configure_s3(
     secret_key: str,
     region: str,
 ) -> None:
-    host, use_ssl = parse_endpoint(endpoint)
+    host, use_ssl = parse_duckdb_endpoint(endpoint)
 
     con.execute("INSTALL httpfs;")
     con.execute("LOAD httpfs;")
@@ -62,23 +77,63 @@ def build_s3_uri(bucket: str, key: str) -> str:
     return f"s3://{bucket.strip('/')}/{key.lstrip('/')}"
 
 
-def merge_parquet(
+def merge_to_local(
     con: duckdb.DuckDBPyConnection,
-  *,
-  source_uri: str,
-  dest_uri: str,
-  temp_directory: str,
-  memory_limit: str,
+    *,
+    source_uri: str,
+    local_path: Path,
+    temp_directory: str,
+    memory_limit: str,
 ) -> None:
     con.execute(f"SET temp_directory='{sql_literal(temp_directory)}';")
     con.execute(f"SET memory_limit='{sql_literal(memory_limit)}';")
 
+    local_path.parent.mkdir(parents=True, exist_ok=True)
     con.execute(
         f"""
         COPY (
             SELECT * FROM read_parquet('{sql_literal(source_uri)}', union_by_name=true)
-        ) TO '{sql_literal(dest_uri)}' (FORMAT PARQUET, COMPRESSION SNAPPY);
+        ) TO '{sql_literal(str(local_path))}' (FORMAT PARQUET, COMPRESSION SNAPPY);
         """
+    )
+
+
+def upload_multipart(
+    *,
+    local_path: Path,
+    endpoint: str,
+    access_key: str,
+    secret_key: str,
+    region: str,
+    bucket: str,
+    key: str,
+    chunk_size: int,
+) -> None:
+    client = boto3.client(
+        "s3",
+        endpoint_url=parse_boto_endpoint(endpoint),
+        aws_access_key_id=access_key,
+        aws_secret_access_key=secret_key,
+        region_name=region,
+        config=Config(
+            s3={"addressing_style": "path"},
+            retries={"max_attempts": 10, "mode": "adaptive"},
+        ),
+    )
+    transfer_config = TransferConfig(
+        multipart_threshold=8 * 1024 * 1024,
+        multipart_chunksize=chunk_size,
+        max_concurrency=10,
+        use_threads=True,
+    )
+
+    size_mb = local_path.stat().st_size / (1024 * 1024)
+    print(f"分段上传: s3://{bucket}/{key} ({size_mb:.1f} MB)")
+    client.upload_file(
+        str(local_path),
+        bucket,
+        key.lstrip("/"),
+        Config=transfer_config,
     )
 
 
@@ -110,6 +165,12 @@ def main() -> None:
         default=os.environ.get("DUCKDB_MEMORY_LIMIT", "4GB"),
         help="DuckDB 内存上限，超出部分落盘",
     )
+    parser.add_argument(
+        "--multipart-chunk-size",
+        type=int,
+        default=int(os.environ.get("MULTIPART_CHUNK_SIZE", str(64 * 1024 * 1024))),
+        help="S3 分段上传每段大小（字节），默认 64MB",
+    )
     args = parser.parse_args()
 
     endpoint = require_env("MINIO_ENDPOINT")
@@ -123,6 +184,7 @@ def main() -> None:
 
     source_uri = build_s3_uri(input_bucket, input_glob)
     dest_uri = build_s3_uri(output_bucket, output_path)
+    local_output = Path(args.temp_directory) / Path(output_path).name
 
     Path(args.temp_directory).mkdir(parents=True, exist_ok=True)
 
@@ -142,13 +204,30 @@ def main() -> None:
         return
 
     print(f"输出: {dest_uri}")
-    merge_parquet(
-        con,
-        source_uri=source_uri,
-        dest_uri=dest_uri,
-        temp_directory=args.temp_directory,
-        memory_limit=args.memory_limit,
-    )
+    print(f"本地临时文件: {local_output}")
+    try:
+        merge_to_local(
+            con,
+            source_uri=source_uri,
+            local_path=local_output,
+            temp_directory=args.temp_directory,
+            memory_limit=args.memory_limit,
+        )
+        upload_multipart(
+            local_path=local_output,
+            endpoint=endpoint,
+            access_key=access_key,
+            secret_key=secret_key,
+            region=region,
+            bucket=output_bucket,
+            key=output_path,
+            chunk_size=args.multipart_chunk_size,
+        )
+    finally:
+        if local_output.exists():
+            local_output.unlink()
+            print(f"已删除本地临时文件: {local_output}")
+
     print("合并完成")
 
 
