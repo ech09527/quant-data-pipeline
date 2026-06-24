@@ -27,4 +27,4 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Syntax check
-        run: python -m py_compile scripts/merge_parquet.py
+        run: python -m py_compile scripts/merge_parquet.py scripts/s3_to_kaggle.py
