@@ -1,0 +1,48 @@
+name: Merge Parquet
+
+on:
+  workflow_dispatch:
+    inputs:
+      input_glob:
+        description: '输入对象 key 通配符，如 binance/futures/um/klines/1h/**/*.parquet'
+        required: true
+        type: string
+        default: 'binance/futures/um/klines/1h/**/*.parquet'
+      output_path:
+        description: '输出对象路径，如 binance/futures/um/klines/1h.parquet'
+        required: true
+        type: string
+        default: 'binance/futures/um/klines/1h.parquet'
+      memory_limit:
+        description: 'DuckDB 内存上限，超出部分自动落盘'
+        required: false
+        type: string
+        default: '4GB'
+
+jobs:
+  merge:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Merge Parquet files with DuckDB
+        env:
+          MINIO_ENDPOINT: ${{ secrets.MINIO_ENDPOINT }}
+          MINIO_ACCESS_KEY: ${{ secrets.MINIO_ACCESS_KEY }}
+          MINIO_SECRET_KEY: ${{ secrets.MINIO_SECRET_KEY }}
+          MINIO_REGION: ${{ secrets.MINIO_REGION || 'us-east-1' }}
+          INPUT_BUCKET: ${{ secrets.INPUT_BUCKET }}
+          OUTPUT_BUCKET: ${{ secrets.OUTPUT_BUCKET || secrets.INPUT_BUCKET }}
+          INPUT_GLOB: ${{ github.event.inputs.input_glob }}
+          OUTPUT_PATH: ${{ github.event.inputs.output_path }}
+          DUCKDB_MEMORY_LIMIT: ${{ github.event.inputs.memory_limit }}
+          DUCKDB_TEMP_DIRECTORY: /tmp/duckdb
+        run: python scripts/merge_parquet.py
