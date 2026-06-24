@@ -51,4 +51,7 @@ jobs:
           OUTPUT_PATH: ${{ github.event.inputs.output_path || 'binance/futures/um/klines/1h.parquet' }}
           DUCKDB_MEMORY_LIMIT: ${{ github.event.inputs.memory_limit || '4GB' }}
           DUCKDB_TEMP_DIRECTORY: /tmp/duckdb
+          MULTIPART_CHUNK_SIZE: '8388608'
+          MULTIPART_CONCURRENCY: '2'
+          UPLOAD_MAX_RETRIES: '5'
         run: python scripts/merge_parquet.py

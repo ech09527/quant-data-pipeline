@@ -6,13 +6,16 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import time
 from pathlib import Path
 from urllib.parse import urlparse
 
 import boto3
 import duckdb
+from boto3.exceptions import S3UploadFailedError
 from boto3.s3.transfer import TransferConfig
 from botocore.config import Config
+from botocore.exceptions import ClientError
 
 
 def require_env(name: str) -> str:
@@ -98,6 +101,14 @@ def merge_to_local(
     )
 
 
+def is_gateway_timeout(exc: BaseException) -> bool:
+    if isinstance(exc, ClientError):
+        code = str(exc.response.get("Error", {}).get("Code", ""))
+        status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+        return code == "524" or status == 524
+    return "524" in str(exc)
+
+
 def upload_multipart(
     *,
     local_path: Path,
@@ -108,6 +119,8 @@ def upload_multipart(
     bucket: str,
     key: str,
     chunk_size: int,
+    max_concurrency: int,
+    max_retries: int,
 ) -> None:
     client = boto3.client(
         "s3",
@@ -118,23 +131,46 @@ def upload_multipart(
         config=Config(
             s3={"addressing_style": "path"},
             retries={"max_attempts": 10, "mode": "adaptive"},
+            connect_timeout=60,
+            read_timeout=300,
         ),
     )
     transfer_config = TransferConfig(
         multipart_threshold=8 * 1024 * 1024,
         multipart_chunksize=chunk_size,
-        max_concurrency=10,
-        use_threads=True,
+        max_concurrency=max_concurrency,
+        use_threads=max_concurrency > 1,
     )
 
     size_mb = local_path.stat().st_size / (1024 * 1024)
-    print(f"分段上传: s3://{bucket}/{key} ({size_mb:.1f} MB)")
-    client.upload_file(
-        str(local_path),
-        bucket,
-        key.lstrip("/"),
-        Config=transfer_config,
+    object_key = key.lstrip("/")
+    print(
+        f"分段上传: s3://{bucket}/{object_key} "
+        f"({size_mb:.1f} MB, chunk={chunk_size // (1024 * 1024)}MB, "
+        f"concurrency={max_concurrency})"
     )
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            upload_started = time.monotonic()
+            client.upload_file(
+                str(local_path),
+                bucket,
+                object_key,
+                Config=transfer_config,
+            )
+            upload_seconds = time.monotonic() - upload_started
+            print(f"上传完成，耗时 {upload_seconds:.1f}s")
+            return
+        except (S3UploadFailedError, ClientError) as exc:
+            if not is_gateway_timeout(exc) or attempt == max_retries:
+                raise
+            wait_seconds = min(60, 2**attempt)
+            print(
+                f"网关超时 (attempt {attempt}/{max_retries}): {exc}; "
+                f"{wait_seconds}s 后重试..."
+            )
+            time.sleep(wait_seconds)
 
 
 def inspect_source(con: duckdb.DuckDBPyConnection, source_uri: str) -> None:
@@ -168,8 +204,20 @@ def main() -> None:
     parser.add_argument(
         "--multipart-chunk-size",
         type=int,
-        default=int(os.environ.get("MULTIPART_CHUNK_SIZE", str(64 * 1024 * 1024))),
-        help="S3 分段上传每段大小（字节），默认 64MB",
+        default=int(os.environ.get("MULTIPART_CHUNK_SIZE", str(8 * 1024 * 1024))),
+        help="S3 分段上传每段大小（字节），默认 8MB",
+    )
+    parser.add_argument(
+        "--multipart-concurrency",
+        type=int,
+        default=int(os.environ.get("MULTIPART_CONCURRENCY", "2")),
+        help="S3 分段上传并发数，默认 2",
+    )
+    parser.add_argument(
+        "--upload-max-retries",
+        type=int,
+        default=int(os.environ.get("UPLOAD_MAX_RETRIES", "5")),
+        help="网关超时后的整次上传重试次数，默认 5",
     )
     args = parser.parse_args()
 
@@ -206,6 +254,7 @@ def main() -> None:
     print(f"输出: {dest_uri}")
     print(f"本地临时文件: {local_output}")
     try:
+        merge_started = time.monotonic()
         merge_to_local(
             con,
             source_uri=source_uri,
@@ -213,6 +262,9 @@ def main() -> None:
             temp_directory=args.temp_directory,
             memory_limit=args.memory_limit,
         )
+        merge_seconds = time.monotonic() - merge_started
+        size_mb = local_output.stat().st_size / (1024 * 1024)
+        print(f"合并完成，耗时 {merge_seconds:.1f}s，文件大小 {size_mb:.1f} MB")
         upload_multipart(
             local_path=local_output,
             endpoint=endpoint,
@@ -222,6 +274,8 @@ def main() -> None:
             bucket=output_bucket,
             key=output_path,
             chunk_size=args.multipart_chunk_size,
+            max_concurrency=args.multipart_concurrency,
+            max_retries=args.upload_max_retries,
         )
     finally:
         if local_output.exists():
