@@ -1,6 +1,12 @@
 name: Merge Parquet
 
 on:
+  push:
+    branches: [master]
+    paths:
+      - '.github/workflows/merge-parquet.yml'
+      - 'scripts/merge_parquet.py'
+      - 'requirements.txt'
   workflow_dispatch:
     inputs:
       input_glob:
@@ -38,11 +44,11 @@ jobs:
           MINIO_ENDPOINT: ${{ secrets.MINIO_ENDPOINT }}
           MINIO_ACCESS_KEY: ${{ secrets.MINIO_ACCESS_KEY }}
           MINIO_SECRET_KEY: ${{ secrets.MINIO_SECRET_KEY }}
-          MINIO_REGION: ${{ secrets.MINIO_REGION || 'us-east-1' }}
+          MINIO_REGION: ${{ secrets.MINIO_REGION }}
           INPUT_BUCKET: ${{ secrets.INPUT_BUCKET }}
-          OUTPUT_BUCKET: ${{ secrets.OUTPUT_BUCKET || secrets.INPUT_BUCKET }}
-          INPUT_GLOB: ${{ github.event.inputs.input_glob }}
-          OUTPUT_PATH: ${{ github.event.inputs.output_path }}
-          DUCKDB_MEMORY_LIMIT: ${{ github.event.inputs.memory_limit }}
+          OUTPUT_BUCKET: ${{ secrets.OUTPUT_BUCKET }}
+          INPUT_GLOB: ${{ github.event.inputs.input_glob || 'binance/futures/um/klines/1h/**/*.parquet' }}
+          OUTPUT_PATH: ${{ github.event.inputs.output_path || 'binance/futures/um/klines/1h.parquet' }}
+          DUCKDB_MEMORY_LIMIT: ${{ github.event.inputs.memory_limit || '4GB' }}
           DUCKDB_TEMP_DIRECTORY: /tmp/duckdb
         run: python scripts/merge_parquet.py
