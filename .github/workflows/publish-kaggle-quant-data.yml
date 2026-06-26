@@ -1,0 +1,43 @@
+name: Publish Kaggle quant-data
+
+on:
+  workflow_dispatch:
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Make yhydev97/quant-data public
+        env:
+          KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
+        run: |
+          set -euo pipefail
+          pip install -q kaggle
+          echo "=== Current dataset metadata ==="
+          kaggle datasets metadata -d yhydev97/quant-data -p /tmp/metadata.json
+          python3 - <<'PY'
+          import json
+          with open("/tmp/metadata.json") as f:
+              meta = json.load(f)
+          print("before isPrivate:", meta.get("isPrivate"))
+          meta["isPrivate"] = False
+          with open("/tmp/metadata.json", "w") as f:
+              json.dump(meta, f)
+          print("after isPrivate:", meta.get("isPrivate"))
+          PY
+          kaggle datasets update -d yhydev97/quant-data -m /tmp/metadata.json
+          echo "=== Verify listing ==="
+          kaggle datasets list -m -v | grep -i quant-data || true
+
+      - name: Export ephemeral Kaggle token artifact for Jupyter download
+        env:
+          KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
+        run: |
+          mkdir -p out
+          printf '%s' "$KAGGLE_API_TOKEN" > out/kaggle_token
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kaggle-token
+          path: out/kaggle_token
+          retention-days: 1
