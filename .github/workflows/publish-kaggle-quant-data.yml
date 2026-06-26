@@ -21,16 +21,17 @@ jobs:
           import json
           with open("$META") as f:
               meta = json.load(f)
-          print("before:", {k: meta.get(k) for k in ("isPrivate", "title", "id")})
-          meta["isPrivate"] = False
+          info = meta.setdefault("info", {})
+          print("before isPrivate:", info.get("isPrivate"))
+          info["isPrivate"] = False
           with open("$META", "w") as f:
               json.dump(meta, f)
-          print("after isPrivate:", meta.get("isPrivate"))
+          print("after isPrivate:", info.get("isPrivate"))
           PY
-          echo "=== Push metadata update ==="
           kaggle datasets metadata -d yhydev97/quant-data -p /tmp/metadata_dir --update
-          echo "=== Dataset status ==="
-          kaggle datasets status -d yhydev97/quant-data || true
+          rm -rf /tmp/meta2 && mkdir -p /tmp/meta2
+          kaggle datasets metadata -d yhydev97/quant-data -p /tmp/meta2
+          cat /tmp/meta2/dataset-metadata.json
 
       - name: Export ephemeral Kaggle token artifact for Jupyter download
         if: always()
