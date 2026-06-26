@@ -1,0 +1,36 @@
+name: List Kaggle Datasets
+
+on:
+  workflow_dispatch:
+
+jobs:
+  list:
+    runs-on: ubuntu-latest
+    steps:
+      - name: List datasets for authenticated account
+        env:
+          KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
+        run: |
+          set -euo pipefail
+          pip install -q kaggle
+          echo "=== Kaggle account (from token introspection) ==="
+          python3 - <<'PY'
+          import os, json, urllib.request
+          token = os.environ.get("KAGGLE_API_TOKEN", "").strip()
+          if not token:
+              raise SystemExit("KAGGLE_API_TOKEN is empty")
+          req = urllib.request.Request(
+              "https://www.kaggle.com/api/v1/users/self",
+              headers={"Authorization": f"Bearer {token}"}
+          )
+          with urllib.request.urlopen(req, timeout=30) as resp:
+              user = json.load(resp)
+          print(json.dumps({
+              "userName": user.get("userName"),
+              "displayName": user.get("displayName"),
+              "id": user.get("id"),
+          }, ensure_ascii=False, indent=2))
+          PY
+          echo
+          echo "=== My datasets (kaggle datasets list -m) ==="
+          kaggle datasets list -m -v
