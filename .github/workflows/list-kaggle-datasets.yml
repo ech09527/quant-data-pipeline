@@ -13,24 +13,11 @@ jobs:
         run: |
           set -euo pipefail
           pip install -q kaggle
-          echo "=== Kaggle account (from token introspection) ==="
-          python3 - <<'PY'
-          import os, json, urllib.request
-          token = os.environ.get("KAGGLE_API_TOKEN", "").strip()
-          if not token:
-              raise SystemExit("KAGGLE_API_TOKEN is empty")
-          req = urllib.request.Request(
-              "https://www.kaggle.com/api/v1/users/self",
-              headers={"Authorization": f"Bearer {token}"}
-          )
-          with urllib.request.urlopen(req, timeout=30) as resp:
-              user = json.load(resp)
-          print(json.dumps({
-              "userName": user.get("userName"),
-              "displayName": user.get("displayName"),
-              "id": user.get("id"),
-          }, ensure_ascii=False, indent=2))
-          PY
+          echo "=== Auth check ==="
+          kaggle config view || true
           echo
-          echo "=== My datasets (kaggle datasets list -m) ==="
+          echo "=== My datasets ==="
           kaggle datasets list -m -v
+          echo
+          echo "=== Dataset count ==="
+          kaggle datasets list -m -v | tail -n +2 | wc -l
