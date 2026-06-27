@@ -153,16 +153,41 @@ def write_dataset_metadata(
     license_name: str,
 ) -> Path:
     metadata_path = staging_dir / "dataset-metadata.json"
-    metadata = {
-        "title": title,
-        "id": dataset_slug,
-        "licenses": [{"name": license_name}],
-    }
+    normalize_dataset_metadata(
+        metadata_path,
+        dataset_slug=dataset_slug,
+        title=title,
+        license_name=license_name,
+    )
+    return metadata_path
+
+
+def normalize_dataset_metadata(
+    metadata_path: Path,
+    *,
+    dataset_slug: str,
+    title: str,
+    license_name: str,
+) -> None:
+    if metadata_path.exists():
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    else:
+        metadata = {}
+
+    metadata["id"] = dataset_slug
+    metadata.setdefault("title", title)
+    metadata.setdefault("licenses", [{"name": license_name}])
+
+    owner, slug = dataset_slug.split("/", 1) if "/" in dataset_slug else ("", dataset_slug)
+    info = metadata.setdefault("info", {})
+    info.setdefault("slug", slug)
+    if owner:
+        info.setdefault("ownerSlug", owner)
+
     metadata_path.write_text(
         json.dumps(metadata, indent=2, ensure_ascii=False) + "\n",
         encoding="utf-8",
     )
-    return metadata_path
 
 
 def ensure_kaggle_metadata(
@@ -194,12 +219,14 @@ def ensure_kaggle_metadata(
             file=sys.stderr,
         )
         print("将使用本地元数据模板继续上传", file=sys.stderr)
-        write_dataset_metadata(
-            staging_dir,
-            dataset_slug=dataset_slug,
-            title=title,
-            license_name=license_name,
-        )
+
+    normalize_dataset_metadata(
+        metadata_path,
+        dataset_slug=dataset_slug,
+        title=title,
+        license_name=license_name,
+    )
+    print(f"已规范化数据集元数据: {metadata_path}")
 
 
 def upload_to_kaggle(
