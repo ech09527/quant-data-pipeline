@@ -24,10 +24,32 @@ on:
         required: false
         type: string
         default: '4GB'
+      symbol_from_path:
+        description: '从文件路径提取 symbol 列（per-symbol 目录结构建议开启）'
+        required: false
+        type: boolean
+        default: true
+      publish_to_kaggle:
+        description: '合并完成后上传到 Kaggle 数据集'
+        required: false
+        type: boolean
+        default: false
+      kaggle_dataset:
+        description: 'Kaggle 数据集 slug'
+        required: false
+        type: string
+        default: 'yhydev97/quant-data'
+      version_notes:
+        description: 'Kaggle 版本说明'
+        required: false
+        type: string
+        default: 'Merged parquet with symbol column from file path'
 
 jobs:
   merge:
     runs-on: ubuntu-latest
+    outputs:
+      output_path: ${{ github.event.inputs.output_path || 'binance/futures/um/klines/1h.parquet' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -54,4 +76,36 @@ jobs:
           MULTIPART_CHUNK_SIZE: '8388608'
           MULTIPART_CONCURRENCY: '2'
           UPLOAD_MAX_RETRIES: '5'
+          SYMBOL_FROM_PATH: ${{ github.event.inputs.symbol_from_path != false && 'true' || 'false' }}
         run: python scripts/merge_parquet.py
+
+  publish-kaggle:
+    needs: merge
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.publish_to_kaggle == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Upload merged parquet to Kaggle
+        env:
+          MINIO_ENDPOINT: ${{ secrets.MINIO_ENDPOINT }}
+          MINIO_ACCESS_KEY: ${{ secrets.MINIO_ACCESS_KEY }}
+          MINIO_SECRET_KEY: ${{ secrets.MINIO_SECRET_KEY }}
+          MINIO_REGION: ${{ secrets.MINIO_REGION }}
+          INPUT_BUCKET: ${{ secrets.INPUT_BUCKET }}
+          INPUT_GLOB: ${{ needs.merge.outputs.output_path }}
+          KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
+          KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
+          KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
+          KAGGLE_DATASET: ${{ github.event.inputs.kaggle_dataset || 'yhydev97/quant-data' }}
+          VERSION_NOTES: ${{ github.event.inputs.version_notes || 'Merged parquet with symbol column from file path' }}
+          KAGGLE_STAGING_DIR: /tmp/kaggle-staging
+        run: python scripts/s3_to_kaggle.py --dir-mode zip

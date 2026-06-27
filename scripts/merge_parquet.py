@@ -80,6 +80,58 @@ def build_s3_uri(bucket: str, key: str) -> str:
     return f"s3://{bucket.strip('/')}/{key.lstrip('/')}"
 
 
+SYMBOL_FROM_FILENAME_REGEX = r"/([^/]+)/[^/]+\.parquet$"
+
+
+def source_has_column(
+    con: duckdb.DuckDBPyConnection,
+    source_uri: str,
+    column_name: str,
+) -> bool:
+    columns = con.execute(
+        f"""
+        DESCRIBE
+        SELECT * FROM read_parquet('{sql_literal(source_uri)}', union_by_name=true)
+        LIMIT 0;
+        """
+    ).fetchall()
+    return any(row[0] == column_name for row in columns)
+
+
+def build_merge_select_sql(
+    con: duckdb.DuckDBPyConnection,
+    source_uri: str,
+    *,
+    symbol_from_path: bool,
+) -> str:
+    literal_uri = sql_literal(source_uri)
+    if not symbol_from_path:
+        return f"SELECT * FROM read_parquet('{literal_uri}', union_by_name=true)"
+
+    has_symbol = source_has_column(con, source_uri, "symbol")
+    symbol_expr = (
+        "COALESCE("
+        "NULLIF(CAST(t.symbol AS VARCHAR), ''), "
+        f"regexp_extract(t.filename, '{SYMBOL_FROM_FILENAME_REGEX}', 1)"
+        ")"
+        if has_symbol
+        else f"regexp_extract(t.filename, '{SYMBOL_FROM_FILENAME_REGEX}', 1)"
+    )
+    exclude_cols = ["filename"]
+    if has_symbol:
+        exclude_cols.append("symbol")
+
+    return f"""
+        SELECT
+            t.* EXCLUDE ({", ".join(exclude_cols)}),
+            {symbol_expr} AS symbol
+        FROM (
+            SELECT *
+            FROM read_parquet('{literal_uri}', union_by_name=true, filename=true)
+        ) AS t
+    """
+
+
 def merge_to_local(
     con: duckdb.DuckDBPyConnection,
     *,
@@ -87,15 +139,21 @@ def merge_to_local(
     local_path: Path,
     temp_directory: str,
     memory_limit: str,
+    symbol_from_path: bool,
 ) -> None:
     con.execute(f"SET temp_directory='{sql_literal(temp_directory)}';")
     con.execute(f"SET memory_limit='{sql_literal(memory_limit)}';")
 
     local_path.parent.mkdir(parents=True, exist_ok=True)
+    select_sql = build_merge_select_sql(
+        con,
+        source_uri,
+        symbol_from_path=symbol_from_path,
+    )
     con.execute(
         f"""
         COPY (
-            SELECT * FROM read_parquet('{sql_literal(source_uri)}', union_by_name=true)
+            {select_sql}
         ) TO '{sql_literal(str(local_path))}' (FORMAT PARQUET, COMPRESSION SNAPPY);
         """
     )
@@ -173,15 +231,35 @@ def upload_multipart(
             time.sleep(wait_seconds)
 
 
-def inspect_source(con: duckdb.DuckDBPyConnection, source_uri: str) -> None:
+def inspect_source(
+    con: duckdb.DuckDBPyConnection,
+    source_uri: str,
+    *,
+    symbol_from_path: bool,
+) -> None:
     file_count = con.execute(
         f"SELECT count(*) FROM glob('{sql_literal(source_uri)}');"
     ).fetchone()[0]
-    row_count = con.execute(
-        f"SELECT count(*) FROM read_parquet('{sql_literal(source_uri)}', union_by_name=true);"
-    ).fetchone()[0]
+    select_sql = build_merge_select_sql(
+        con,
+        source_uri,
+        symbol_from_path=symbol_from_path,
+    )
+    row_count = con.execute(f"SELECT count(*) FROM ({select_sql}) AS merged;").fetchone()[0]
     print(f"匹配文件数: {file_count}")
     print(f"总行数: {row_count}")
+    if symbol_from_path:
+        symbol_count = con.execute(
+            f"SELECT count(DISTINCT symbol) FROM ({select_sql}) AS merged "
+            "WHERE symbol IS NOT NULL AND symbol <> '';"
+        ).fetchone()[0]
+        empty_symbol_count = con.execute(
+            f"SELECT count(*) FROM ({select_sql}) AS merged "
+            "WHERE symbol IS NULL OR symbol = '';"
+        ).fetchone()[0]
+        print(f"symbol 列: 从文件路径提取，distinct={symbol_count}")
+        if empty_symbol_count:
+            print(f"警告: 有 {empty_symbol_count} 行未能解析 symbol")
 
 
 def main() -> None:
@@ -219,6 +297,24 @@ def main() -> None:
         default=int(os.environ.get("UPLOAD_MAX_RETRIES", "5")),
         help="网关超时后的整次上传重试次数，默认 5",
     )
+    symbol_from_path_default = os.environ.get("SYMBOL_FROM_PATH", "true").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+    parser.add_argument(
+        "--symbol-from-path",
+        dest="symbol_from_path",
+        action="store_true",
+        default=symbol_from_path_default,
+        help="从 Parquet 文件路径提取 symbol 列（默认开启）",
+    )
+    parser.add_argument(
+        "--no-symbol-from-path",
+        dest="symbol_from_path",
+        action="store_false",
+        help="不提取 symbol，仅合并原始列",
+    )
     args = parser.parse_args()
 
     endpoint = require_env("MINIO_ENDPOINT")
@@ -246,8 +342,9 @@ def main() -> None:
     )
 
     print(f"输入: {source_uri}")
+    print(f"symbol 提取: {'开启（从路径）' if args.symbol_from_path else '关闭'}")
     if args.dry_run:
-        inspect_source(con, source_uri)
+        inspect_source(con, source_uri, symbol_from_path=args.symbol_from_path)
         print("dry-run 完成，未写入输出文件")
         return
 
@@ -261,6 +358,7 @@ def main() -> None:
             local_path=local_output,
             temp_directory=args.temp_directory,
             memory_limit=args.memory_limit,
+            symbol_from_path=args.symbol_from_path,
         )
         merge_seconds = time.monotonic() - merge_started
         size_mb = local_output.stat().st_size / (1024 * 1024)
