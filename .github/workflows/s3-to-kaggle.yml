@@ -1,5 +1,7 @@
 name: S3 to Kaggle
 
+# 仅上传 MinIO 已有对象到 Kaggle；完整管道（合并 + 发布）请使用 Quant Data Pipeline workflow。
+
 on:
   workflow_dispatch:
     inputs:

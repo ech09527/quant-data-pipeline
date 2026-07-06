@@ -5,10 +5,15 @@ from __future__ import annotations
 
 import argparse
 import os
+import shutil
 import sys
 import time
 from pathlib import Path
 from urllib.parse import urlparse
+
+_SCRIPT_DIR = Path(__file__).resolve().parent
+if str(_SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPT_DIR))
 
 import boto3
 import duckdb
@@ -16,6 +21,9 @@ from boto3.exceptions import S3UploadFailedError
 from boto3.s3.transfer import TransferConfig
 from botocore.config import Config
 from botocore.exceptions import ClientError
+
+from kaggle_publish import configure_kaggle_auth, publish_staging_dir
+from s3_client import parse_boto_endpoint
 
 
 def require_env(name: str) -> str:
@@ -38,18 +46,6 @@ def parse_duckdb_endpoint(endpoint: str) -> tuple[str, bool]:
 
     use_ssl = parsed.scheme != "http"
     return host, use_ssl
-
-
-def parse_boto_endpoint(endpoint: str) -> str:
-    normalized = endpoint if "://" in endpoint else f"https://{endpoint}"
-    parsed = urlparse(normalized)
-    if not parsed.hostname:
-        raise ValueError(f"无法解析 MINIO_ENDPOINT: {endpoint}")
-
-    endpoint_url = f"{parsed.scheme}://{parsed.hostname}"
-    if parsed.port:
-        endpoint_url = f"{endpoint_url}:{parsed.port}"
-    return endpoint_url
 
 
 def sql_literal(value: str) -> str:
@@ -315,6 +311,47 @@ def main() -> None:
         action="store_false",
         help="不提取 symbol，仅合并原始列",
     )
+    publish_default = os.environ.get("PUBLISH_TO_KAGGLE", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+    parser.add_argument(
+        "--publish-to-kaggle",
+        action="store_true",
+        default=publish_default,
+        help="合并并上传 MinIO 后，直接发布到 Kaggle（复用本地文件，无需二次下载）",
+    )
+    parser.add_argument(
+        "--no-publish-to-kaggle",
+        dest="publish_to_kaggle",
+        action="store_false",
+        help="仅合并并写回 MinIO，不上传 Kaggle",
+    )
+    parser.add_argument(
+        "--kaggle-staging-dir",
+        default=os.environ.get("KAGGLE_STAGING_DIR", "/tmp/kaggle-staging"),
+        help="Kaggle 上传暂存目录",
+    )
+    parser.add_argument(
+        "--kaggle-dir-mode",
+        choices=("zip", "tar"),
+        default=os.environ.get("KAGGLE_DIR_MODE", "zip"),
+        help="Kaggle 上传打包方式，默认 zip",
+    )
+    parser.add_argument(
+        "--kaggle-create-new",
+        action="store_true",
+        default=os.environ.get("KAGGLE_CREATE_NEW", "").strip().lower()
+        in {"1", "true", "yes"},
+        help="创建新的 Kaggle 数据集（默认上传新版本）",
+    )
+    parser.add_argument(
+        "--kaggle-public",
+        action="store_true",
+        default=os.environ.get("KAGGLE_PUBLIC", "").strip().lower() in {"1", "true", "yes"},
+        help="创建新数据集时设为公开（仅 --kaggle-create-new 生效）",
+    )
     args = parser.parse_args()
 
     endpoint = require_env("MINIO_ENDPOINT")
@@ -375,12 +412,56 @@ def main() -> None:
             max_concurrency=args.multipart_concurrency,
             max_retries=args.upload_max_retries,
         )
+
+        if args.publish_to_kaggle:
+            dataset_slug = os.environ.get("KAGGLE_DATASET", "").strip()
+            if not dataset_slug:
+                print("缺少 KAGGLE_DATASET，无法发布到 Kaggle", file=sys.stderr)
+                sys.exit(1)
+
+            version_notes = os.environ.get(
+                "VERSION_NOTES",
+                "Merged parquet with symbol column from file path",
+            ).strip()
+            dataset_title = os.environ.get(
+                "KAGGLE_DATASET_TITLE",
+                dataset_slug.split("/", 1)[-1].replace("-", " ").title(),
+            ).strip()
+            license_name = os.environ.get("KAGGLE_LICENSE", "CC0-1.0").strip() or "CC0-1.0"
+
+            configure_kaggle_auth()
+
+            staging_dir = Path(args.kaggle_staging_dir)
+            if staging_dir.exists():
+                shutil.rmtree(staging_dir)
+            staging_dir.mkdir(parents=True, exist_ok=True)
+            staged_file = staging_dir / output_path.lstrip("/")
+            staged_file.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(local_output, staged_file)
+            print(f"Kaggle 暂存: {staged_file}")
+
+            publish_started = time.monotonic()
+            publish_staging_dir(
+                staging_dir,
+                dataset_slug=dataset_slug,
+                version_notes=version_notes,
+                dataset_title=dataset_title,
+                license_name=license_name,
+                create_new=args.kaggle_create_new,
+                dir_mode=args.kaggle_dir_mode,
+                public=args.kaggle_public,
+            )
+            publish_seconds = time.monotonic() - publish_started
+            print(f"Kaggle 发布完成，耗时 {publish_seconds:.1f}s")
+
+            shutil.rmtree(staging_dir)
+            print(f"已清理 Kaggle 暂存目录: {staging_dir}")
     finally:
         if local_output.exists():
             local_output.unlink()
             print(f"已删除本地临时文件: {local_output}")
 
-    print("合并完成")
+    print("管道任务完成")
 
 
 if __name__ == "__main__":
