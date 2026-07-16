@@ -18,18 +18,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
         with:
-          python-version: '3.12'
-          cache: pip
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.12
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: uv sync --no-dev
 
       - name: Syntax check
         run: |
-          python -m py_compile \
+          uv run python -m py_compile \
             scripts/kaggle_publish.py \
             scripts/s3_client.py \
             scripts/merge_parquet.py \
-            scripts/s3_to_kaggle.py
+            scripts/s3_to_kaggle.py \
+            scripts/funding_rate_to_kaggle.py \
+            scripts/check_binance_network.py

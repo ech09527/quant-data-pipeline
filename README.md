@@ -1,27 +1,29 @@
 # Quant Data Pipeline
 
-本仓库用于管理量化数据管道任务，通过 GitHub Actions 从 MinIO 读取数据，合并 Parquet 并发布到 Kaggle。
+本仓库用于管理量化数据管道任务。**线上环境在 GitHub Actions 中运行**；网络代理、Kaggle API Token、MinIO 凭证等程序所需配置，统一写在仓库的 **GitHub Secrets** 中，由 workflow 注入为环境变量。
 
 ## 项目说明
 
 当前使用 [DuckDB](https://duckdb.org/) 的 `httpfs` 扩展从 MinIO（S3 兼容存储）读取 per-symbol Parquet，合并后写回 MinIO，并可直接发布到 Kaggle 数据集。合并完成后复用本地文件上传 Kaggle，**无需再从 MinIO 二次下载**。
 
-另保留独立的 S3 → Kaggle 传输脚本，用于仅上传 MinIO 上已有对象（不经过合并）的场景。
+另保留独立的 S3 → Kaggle 传输脚本，以及 Binance Vision 资金费率下载合并脚本。
 
 ## 目录结构
 
 ```
 .
 ├── scripts/
-│   ├── merge_parquet.py      # 合并 + 可选 Kaggle 发布（主入口）
-│   ├── s3_to_kaggle.py       # 仅 S3 → Kaggle 传输
-│   ├── kaggle_publish.py     # Kaggle 发布公共模块
-│   └── s3_client.py            # MinIO/S3 客户端公共模块
+│   ├── merge_parquet.py           # 合并 + 可选 Kaggle 发布（主入口）
+│   ├── funding_rate_to_kaggle.py  # 下载 UM USDT 资金费率并发布 Kaggle
+│   ├── s3_to_kaggle.py            # 仅 S3 → Kaggle 传输
+│   ├── kaggle_publish.py          # Kaggle 发布公共模块
+│   └── s3_client.py               # MinIO/S3 客户端公共模块
 ├── .github/
 │   └── workflows/
 │       ├── lint-pipelines.yml
-│       ├── quant-data-pipeline.yml   # 合并 + 发布（主 workflow）
-│       └── s3-to-kaggle.yml          # 仅上传已有对象
+│       ├── quant-data-pipeline.yml      # 合并 + 发布（主 workflow）
+│       ├── funding-rate-to-kaggle.yml   # 资金费率下载合并 → Kaggle
+│       └── s3-to-kaggle.yml             # 仅上传已有对象
 ├── requirements.txt
 ├── .env                        # 本地环境变量（勿提交）
 └── README.md
@@ -59,7 +61,8 @@
 | `KAGGLE_DIR_MODE` | 上传打包方式：`zip` 或 `tar`，默认 `zip` |
 | `KAGGLE_PUBLIC` | 设为 `true` 时新建公开数据集（`--kaggle-create-new`） |
 
-敏感信息请通过 GitHub Secrets 或本地 `.env` 注入，不要写入代码。
+**线上**：上述敏感项与代理等配置放在仓库 Secrets，由 Actions 注入。  
+**本地**：可用 `.env` 注入同名变量做调试（勿提交）。不要把密钥写进代码或 workflow 明文。
 
 ## 本地运行
 
@@ -84,15 +87,74 @@ python scripts/s3_to_kaggle.py
 python scripts/s3_to_kaggle.py --create-new --public
 ```
 
-## GitHub Workflow
+## 资金费率（Vision → Kaggle）
+
+从 [Binance Vision](https://data.binance.vision/) 下载 UM 永续 **USDT** 月度 `fundingRate` ZIP，合并为单个 Parquet（含 `symbol`），直接发布到 Kaggle（不上 MinIO）。
+
+字段：`symbol`, `calc_time`, `funding_interval_hours`, `last_funding_rate`
+
+线上由 `funding-rate-to-kaggle.yml` 调度；代理与 Kaggle 认证从仓库 Secrets 注入（见下文「仓库 Secrets」）。代理与 `bn-data-collect` 合约 K 线采集一致：
+
+| 变量 | 说明 |
+|------|------|
+| `FAPI_HTTP_PROXY` | 访问 `fapi.binance.com`（交易对） |
+| `VISION_HTTP_PROXY` | 访问 `data.binance.vision`（ZIP） |
+
+本地试跑几个合约（用 `uv`，勿依赖 bash 脚本；本地直连可用时可不设代理）：
+
+```text
+uv sync --no-dev
+# 可选：FAPI_HTTP_PROXY=... VISION_HTTP_PROXY=...
+SYMBOLS=BTCUSDT,ETHUSDT,SOLUSDT \
+START_MONTH=2025-01 \
+END_MONTH=2025-02 \
+WORK_DIR=/tmp/funding-rate-test \
+PUBLISH_TO_KAGGLE=false \
+uv run funding-rate-to-kaggle
+```
+
+网络连通性检查：
+
+```text
+uv run check-binance-network
+```
+
+全量并上传 Kaggle：
+
+```text
+KAGGLE_DATASET=yhydev97/quant-data \
+KAGGLE_API_TOKEN=... \
+PUBLISH_TO_KAGGLE=true \
+uv run funding-rate-to-kaggle
+```
+
+默认输出路径：`binance/futures/um/fundingRate.parquet`。更新已有数据集时会先拉取现有文件再写入/覆盖该路径，避免冲掉已有 klines。
+
+## GitHub Workflow（线上环境）
+
+正式跑数、定时更新都在 **GitHub Actions** 上执行（`ubuntu-latest`）。workflow 从仓库 Secrets 读取配置并注入环境变量，脚本本身不硬编码密钥或代理。
 
 | Workflow | 触发方式 | 说明 |
 |----------|---------|------|
 | `lint-pipelines.yml` | push / pull_request | Python 语法检查 |
 | `quant-data-pipeline.yml` | `workflow_dispatch` / push | **主流程**：合并 + 写回 MinIO + 发布 Kaggle |
+| `funding-rate-to-kaggle.yml` | `workflow_dispatch` / 每周一 | 资金费率下载合并 → Kaggle |
 | `s3-to-kaggle.yml` | `workflow_dispatch` | 仅上传 MinIO 已有对象到 Kaggle |
 
-主流程需在 GitHub Secrets 中配置：`MINIO_ENDPOINT`、`MINIO_ACCESS_KEY`、`MINIO_SECRET_KEY`、`INPUT_BUCKET`，以及可选的 `MINIO_REGION`、`OUTPUT_BUCKET`。发布 Kaggle 时需额外配置 `KAGGLE_API_TOKEN`（推荐），或 Legacy 方式的 `KAGGLE_USERNAME` + `KAGGLE_KEY`。
+### 仓库 Secrets
+
+在仓库 **Settings → Secrets and variables → Actions** 中配置（按所用 workflow 需要）：
+
+| Secret | 用途 | 相关 workflow |
+|--------|------|----------------|
+| `MINIO_ENDPOINT` / `MINIO_ACCESS_KEY` / `MINIO_SECRET_KEY` | MinIO 访问 | 主流程、`s3-to-kaggle` |
+| `MINIO_REGION` / `INPUT_BUCKET` / `OUTPUT_BUCKET` | 区域与桶（可选/按需） | 主流程、`s3-to-kaggle` |
+| `KAGGLE_API_TOKEN` | Kaggle 认证（推荐，`KGAT_` 开头） | 所有发布到 Kaggle 的流程 |
+| `KAGGLE_USERNAME` + `KAGGLE_KEY` | Legacy Kaggle 认证（可选） | 同上 |
+| `FAPI_HTTP_PROXY` | 访问 `fapi.binance.com` | `funding-rate-to-kaggle` |
+| `VISION_HTTP_PROXY` | 访问 `data.binance.vision` | `funding-rate-to-kaggle` |
+
+`FAPI_HTTP_PROXY` / `VISION_HTTP_PROXY` 与 `bn-data-collect` 合约采集侧代理约定一致。非敏感参数（如 `KAGGLE_DATASET`、时间范围）一般由 workflow 默认值或 `workflow_dispatch` 输入提供，不必放进 Secrets。
 
 手动触发 **Quant Data Pipeline** 时可指定：
 
