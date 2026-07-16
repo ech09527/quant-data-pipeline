@@ -1,0 +1,131 @@
+name: Inspect Funding Rate Parquet
+
+on:
+  workflow_dispatch:
+    inputs:
+      kaggle_dataset:
+        description: "Kaggle dataset slug"
+        required: false
+        type: string
+        default: "yhydev97/quant-data"
+      relative_path:
+        description: "Path inside the dataset"
+        required: false
+        type: string
+        default: "binance/futures/um/fundingRate.parquet"
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        run: uv sync --no-dev
+
+      - name: Download and inspect fundingRate parquet
+        env:
+          KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
+          KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
+          KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
+          KAGGLE_DATASET: ${{ github.event.inputs.kaggle_dataset }}
+          RELATIVE_PATH: ${{ github.event.inputs.relative_path }}
+        run: |
+          set -euo pipefail
+          uv run python <<'PY'
+          import os
+          import tempfile
+          from pathlib import Path
+
+          import pandas as pd
+          from kaggle_publish import configure_kaggle_auth, get_kaggle_api
+
+          dataset = os.environ["KAGGLE_DATASET"].strip()
+          rel = os.environ["RELATIVE_PATH"].strip().lstrip("/")
+          configure_kaggle_auth()
+          api = get_kaggle_api()
+
+          work = Path(tempfile.mkdtemp(prefix="inspect-funding-"))
+          print(f"dataset={dataset}")
+          print(f"relative_path={rel}")
+          print("--- dataset files ---")
+          try:
+              files = api.dataset_list_files(dataset)
+              file_list = getattr(files, "files", files) or []
+              for f in file_list:
+                  name = getattr(f, "name", None) or getattr(f, "totalBytes", None)
+                  # kaggle SDK shapes differ by version
+                  n = getattr(f, "name", str(f))
+                  size = getattr(f, "total_bytes", None) or getattr(f, "totalBytes", None) or getattr(f, "size", "?")
+                  print(f"  {n}\tsize={size}")
+          except Exception as exc:
+              print(f"(list files skipped: {exc})")
+
+          print("--- download ---")
+          # Prefer single-file download when supported
+          target = work / Path(rel).name
+          downloaded = False
+          for kwargs in (
+              {"dataset": dataset, "file_name": rel, "path": str(work), "quiet": False, "force": True},
+              {"dataset": dataset, "file_name": Path(rel).name, "path": str(work), "quiet": False, "force": True},
+          ):
+              try:
+                  api.dataset_download_file(**kwargs)
+                  downloaded = True
+                  break
+              except Exception as exc:
+                  print(f"dataset_download_file failed ({kwargs.get('file_name')}): {exc}")
+
+          if not downloaded:
+              print("fallback: download full dataset zip and locate file")
+              api.dataset_download_files(dataset, path=str(work), quiet=False, unzip=True)
+              candidates = list(work.rglob(Path(rel).name))
+              if not candidates:
+                  raise SystemExit(f"cannot find {rel} under {work}")
+              target = candidates[0]
+          else:
+              # may be zip of single file
+              zips = list(work.glob("*.zip"))
+              if zips and not target.exists():
+                  import zipfile
+                  with zipfile.ZipFile(zips[0]) as zf:
+                      zf.extractall(work)
+              if not target.exists():
+                  hits = list(work.rglob(Path(rel).name))
+                  if not hits:
+                      raise SystemExit(f"download ok but file missing in {work}: {list(work.iterdir())}")
+                  target = hits[0]
+
+          size_bytes = target.stat().st_size
+          print("--- file ---")
+          print(f"path={target}")
+          print(f"size_bytes={size_bytes}")
+          print(f"size_mb={size_bytes / (1024 * 1024):.4f}")
+
+          df = pd.read_parquet(target)
+          print("--- schema ---")
+          print(df.dtypes.to_string())
+          print("--- columns ---")
+          print(",".join(map(str, df.columns.tolist())))
+          print("--- shape ---")
+          print(f"rows={len(df)} cols={df.shape[1]}")
+          if "symbol" in df.columns:
+              print(f"symbols={df['symbol'].nunique()}")
+          if "calc_time" in df.columns:
+              print(f"calc_time_min={df['calc_time'].min()}")
+              print(f"calc_time_max={df['calc_time'].max()}")
+          print("--- head(5) ---")
+          print(df.head(5).to_string(index=False))
+          print("inspect_done")
+          PY
