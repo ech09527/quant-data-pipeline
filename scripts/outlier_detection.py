@@ -135,15 +135,19 @@ def _detect_volume_anomalies(df: pd.DataFrame, report: OutlierReport) -> pd.Data
 
     non_zero_volume = df.loc[~zero_vol_mask, "volume"]
     if len(non_zero_volume) > 1:
-        mean_vol = non_zero_volume.mean()
-        std_vol = non_zero_volume.std()
-        if std_vol > 0:
-            extreme_mask = (df["volume"] - mean_vol).abs() > (5 * std_vol)
-            extreme_mask = extreme_mask & ~zero_vol_mask
+        median_vol = non_zero_volume.median()
+        mad = (non_zero_volume - median_vol).abs().median()
+        if mad > 0:
+            # MAD-to-sigma conversion factor for normal distribution
+            threshold = median_vol + 5 * mad * 1.4826
+            extreme_mask = (df["volume"] > threshold) & ~zero_vol_mask
             report.extreme_volume_count = int(extreme_mask.sum())
             report.extreme_volume_indices = df.index[extreme_mask].tolist()
         else:
-            report.extreme_volume_count = 0
+            # All non-zero volumes are identical; any different value is extreme
+            extreme_mask = (df["volume"] != median_vol) & ~zero_vol_mask & (df["volume"] > 0)
+            report.extreme_volume_count = int(extreme_mask.sum())
+            report.extreme_volume_indices = df.index[extreme_mask].tolist()
     else:
         report.extreme_volume_count = 0
 
