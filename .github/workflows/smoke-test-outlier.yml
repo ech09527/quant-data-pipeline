@@ -1,0 +1,163 @@
+name: Smoke Test - Outlier Detection
+
+on:
+  push:
+    paths:
+      - 'scripts/outlier_detection.py'
+      - '.github/workflows/smoke-test-outlier.yml'
+  pull_request:
+    paths:
+      - 'scripts/outlier_detection.py'
+      - '.github/workflows/smoke-test-outlier.yml'
+  workflow_dispatch:
+
+jobs:
+  smoke-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install pandas numpy pyarrow
+
+      - name: Run outlier detection smoke test
+        run: |
+          python3 - <<'PYTEST_SCRIPT'
+          import sys
+          import os
+          sys.path.insert(0, os.path.join(os.getcwd(), 'scripts'))
+
+          import pandas as pd
+          import numpy as np
+          from outlier_detection import clean_kline_outliers, OutlierReport
+
+          def make_base_df(n=20):
+              """Create base kline data with 1h intervals."""
+              base_time = 1700000000000
+              times = [base_time + i * 3600000 for i in range(n)]
+              return pd.DataFrame({
+                  "open_time": times,
+                  "open": [100.0] * n,
+                  "high": [105.0] * n,
+                  "low": [95.0] * n,
+                  "close": [102.0] * n,
+                  "volume": [1000.0] * n,
+                  "close_time": [t + 3599999 for t in times],
+                  "quote_volume": [100000.0] * n,
+                  "trades": [50] * n,
+                  "taker_buy_base_volume": [500.0] * n,
+                  "taker_buy_quote_volume": [50000.0] * n,
+                  "ignore": [0] * n,
+                  "symbol": ["BTCUSDT"] * n,
+              })
+
+          errors = []
+
+          # Test 1: OHLC inconsistency auto-correction
+          print("Test 1: OHLC inconsistency correction...")
+          df = make_base_df(5)
+          df.loc[1, "high"] = 90.0   # high < low (95)
+          df.loc[2, "low"] = 110.0   # low > high (105)
+          cleaned, report = clean_kline_outliers(df)
+          if report.ohlc_inconsistent_count != 2:
+              errors.append(f"T1: expected 2 OHLC inconsistencies, got {report.ohlc_inconsistent_count}")
+          if report.ohlc_corrected_count < 2:
+              errors.append(f"T1: expected >=2 corrections, got {report.ohlc_corrected_count}")
+          # Verify corrected values
+          if cleaned.loc[1, "high"] < cleaned.loc[1, "low"]:
+              errors.append(f"T1: row 1 high still < low after correction")
+          if cleaned.loc[2, "low"] > cleaned.loc[2, "high"]:
+              errors.append(f"T1: row 2 low still > high after correction")
+          print(f"  OHLC inconsistent: {report.ohlc_inconsistent_count}, corrected: {report.ohlc_corrected_count}")
+
+          # Test 2: Price jump detection
+          print("Test 2: Price jump detection...")
+          df = make_base_df(10)
+          df.loc[5, "close"] = 200.0  # ~96% jump from 102
+          cleaned, report = clean_kline_outliers(df)
+          if report.price_jump_count < 1:
+              errors.append(f"T2: expected >=1 price jumps, got {report.price_jump_count}")
+          if "_price_jump" not in cleaned.columns:
+              errors.append("T2: _price_jump column missing")
+          print(f"  Price jumps detected: {report.price_jump_count}")
+
+          # Test 3: Zero volume detection
+          print("Test 3: Zero volume detection...")
+          df = make_base_df(10)
+          df.loc[3, "volume"] = 0
+          df.loc[7, "volume"] = 0
+          cleaned, report = clean_kline_outliers(df)
+          if report.zero_volume_count != 2:
+              errors.append(f"T3: expected 2 zero volumes, got {report.zero_volume_count}")
+          if "_zero_volume" not in cleaned.columns:
+              errors.append("T3: _zero_volume column missing")
+          print(f"  Zero volumes: {report.zero_volume_count}")
+
+          # Test 4: Extreme volume detection (>5σ)
+          print("Test 4: Extreme volume detection...")
+          df = make_base_df(20)
+          df.loc[10, "volume"] = 50000.0  # extreme outlier vs 1000 baseline
+          cleaned, report = clean_kline_outliers(df)
+          if report.extreme_volume_count < 1:
+              errors.append(f"T4: expected >=1 extreme volumes, got {report.extreme_volume_count}")
+          print(f"  Extreme volumes: {report.extreme_volume_count}")
+
+          # Test 5: Duplicate timestamp removal
+          print("Test 5: Duplicate timestamp removal...")
+          df = make_base_df(5)
+          dup_row = df.iloc[2:3].copy()
+          df = pd.concat([df, dup_row], ignore_index=True)
+          cleaned, report = clean_kline_outliers(df)
+          if report.duplicate_timestamp_count != 1:
+              errors.append(f"T5: expected 1 duplicate, got {report.duplicate_timestamp_count}")
+          if len(cleaned) != 5:
+              errors.append(f"T5: expected 5 rows after dedup, got {len(cleaned)}")
+          print(f"  Duplicates removed: {report.duplicates_removed}")
+
+          # Test 6: Missing timestamp detection
+          print("Test 6: Missing timestamp detection...")
+          df = make_base_df(10)
+          # Remove rows 4-6 to create a gap of 3 hours
+          df = df.drop([4, 5, 6]).reset_index(drop=True)
+          cleaned, report = clean_kline_outliers(df)
+          if report.missing_timestamp_count < 2:
+              errors.append(f"T6: expected >=2 missing timestamps, got {report.missing_timestamp_count}")
+          print(f"  Missing timestamps: {report.missing_timestamp_count}")
+
+          # Test 7: Empty DataFrame handling
+          print("Test 7: Empty DataFrame...")
+          df_empty = pd.DataFrame(columns=["open_time", "open", "high", "low", "close", "volume"])
+          cleaned, report = clean_kline_outliers(df_empty)
+          if len(cleaned) != 0:
+              errors.append(f"T7: expected empty result, got {len(cleaned)} rows")
+          print(f"  Empty handled correctly")
+
+          # Test 8: Clean data passes through unchanged
+          print("Test 8: Clean data passthrough...")
+          df = make_base_df(10)
+          cleaned, report = clean_kline_outliers(df)
+          if report.ohlc_inconsistent_count != 0:
+              errors.append(f"T8: clean data has {report.ohlc_inconsistent_count} OHLC issues")
+          if report.price_jump_count != 0:
+              errors.append(f"T8: clean data has {report.price_jump_count} price jumps")
+          if report.zero_volume_count != 0:
+              errors.append(f"T8: clean data has {report.zero_volume_count} zero volumes")
+          if report.duplicate_timestamp_count != 0:
+              errors.append(f"T8: clean data has {report.duplicate_timestamp_count} duplicates")
+          print(f"  Clean data passed through with no issues")
+
+          # Summary
+          print("\n" + "="*50)
+          if errors:
+              print(f"FAILED: {len(errors)} error(s):")
+              for e in errors:
+                  print(f"  ✗ {e}")
+              sys.exit(1)
+          else:
+              print("ALL TESTS PASSED ✓")
+          PYTEST_SCRIPT

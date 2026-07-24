@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""使用 DuckDB 从 MinIO (S3 兼容) 合并多个 Parquet 文件为一个。"""
+"""合并本地 Parquet 文件，执行异常值检测，并可选上传 Kaggle。
+
+数据流：本地读取已下载的 parquet → 合并 → 异常值处理 → 写本地 parquet → 上传 Kaggle
+"""
 
 from __future__ import annotations
 
@@ -9,21 +12,15 @@ import shutil
 import sys
 import time
 from pathlib import Path
-from urllib.parse import urlparse
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
 if str(_SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPT_DIR))
 
-import boto3
-import duckdb
-from boto3.exceptions import S3UploadFailedError
-from boto3.s3.transfer import TransferConfig
-from botocore.config import Config
-from botocore.exceptions import ClientError
+import pandas as pd
 
 from kaggle_publish import configure_kaggle_auth, publish_staging_dir
-from s3_client import parse_boto_endpoint
+from outlier_detection import clean_kline_outliers
 
 
 def require_env(name: str) -> str:
@@ -34,299 +31,118 @@ def require_env(name: str) -> str:
     return value
 
 
-def parse_duckdb_endpoint(endpoint: str) -> tuple[str, bool]:
-    normalized = endpoint if "://" in endpoint else f"https://{endpoint}"
-    parsed = urlparse(normalized)
-    host = parsed.hostname
-    if not host:
-        raise ValueError(f"无法解析 MINIO_ENDPOINT: {endpoint}")
-
-    if parsed.port:
-        host = f"{host}:{parsed.port}"
-
-    use_ssl = parsed.scheme != "http"
-    return host, use_ssl
-
-
-def sql_literal(value: str) -> str:
-    return value.replace("'", "''")
-
-
-def configure_s3(
-    con: duckdb.DuckDBPyConnection,
+def merge_local_parquets(
+    input_dir: str,
+    output_path: Path,
     *,
-    endpoint: str,
-    access_key: str,
-    secret_key: str,
-    region: str,
-) -> None:
-    host, use_ssl = parse_duckdb_endpoint(endpoint)
+    symbol_from_path: bool = True,
+) -> int:
+    """读取目录下所有 parquet 文件并合并为一个 DataFrame。
 
-    con.execute("INSTALL httpfs;")
-    con.execute("LOAD httpfs;")
-    con.execute(f"SET s3_endpoint='{sql_literal(host)}';")
-    con.execute(f"SET s3_access_key_id='{sql_literal(access_key)}';")
-    con.execute(f"SET s3_secret_access_key='{sql_literal(secret_key)}';")
-    con.execute(f"SET s3_region='{sql_literal(region)}';")
-    con.execute("SET s3_url_style='path';")
-    con.execute(f"SET s3_use_ssl={'true' if use_ssl else 'false'};")
-
-
-def build_s3_uri(bucket: str, key: str) -> str:
-    return f"s3://{bucket.strip('/')}/{key.lstrip('/')}"
-
-
-SYMBOL_FROM_FILENAME_REGEX = r"/([^/]+)/[^/]+\.parquet$"
-
-
-def source_has_column(
-    con: duckdb.DuckDBPyConnection,
-    source_uri: str,
-    column_name: str,
-) -> bool:
-    columns = con.execute(
-        f"""
-        DESCRIBE
-        SELECT * FROM read_parquet('{sql_literal(source_uri)}', union_by_name=true)
-        LIMIT 0;
-        """
-    ).fetchall()
-    return any(row[0] == column_name for row in columns)
-
-
-def build_merge_select_sql(
-    con: duckdb.DuckDBPyConnection,
-    source_uri: str,
-    *,
-    symbol_from_path: bool,
-) -> str:
-    literal_uri = sql_literal(source_uri)
-    if not symbol_from_path:
-        return f"SELECT * FROM read_parquet('{literal_uri}', union_by_name=true)"
-
-    has_symbol = source_has_column(con, source_uri, "symbol")
-    symbol_expr = (
-        "COALESCE("
-        "NULLIF(CAST(t.symbol AS VARCHAR), ''), "
-        f"regexp_extract(t.filename, '{SYMBOL_FROM_FILENAME_REGEX}', 1)"
-        ")"
-        if has_symbol
-        else f"regexp_extract(t.filename, '{SYMBOL_FROM_FILENAME_REGEX}', 1)"
-    )
-    exclude_cols = ["filename"]
-    if has_symbol:
-        exclude_cols.append("symbol")
-
-    return f"""
-        SELECT
-            t.* EXCLUDE ({", ".join(exclude_cols)}),
-            {symbol_expr} AS symbol
-        FROM (
-            SELECT *
-            FROM read_parquet('{literal_uri}', union_by_name=true, filename=true)
-        ) AS t
+    Returns:
+        合并后的总行数
     """
+    input_path = Path(input_dir)
+    if not input_path.exists():
+        raise FileNotFoundError(f"输入目录不存在: {input_dir}")
 
+    parquet_files = sorted(input_path.rglob("*.parquet"))
+    if not parquet_files:
+        raise FileNotFoundError(f"未找到 parquet 文件: {input_dir}")
 
-def merge_to_local(
-    con: duckdb.DuckDBPyConnection,
-    *,
-    source_uri: str,
-    local_path: Path,
-    temp_directory: str,
-    memory_limit: str,
-    symbol_from_path: bool,
-) -> None:
-    con.execute(f"SET temp_directory='{sql_literal(temp_directory)}';")
-    con.execute(f"SET memory_limit='{sql_literal(memory_limit)}';")
+    print(f"发现 {len(parquet_files)} 个 parquet 文件")
 
-    local_path.parent.mkdir(parents=True, exist_ok=True)
-    select_sql = build_merge_select_sql(
-        con,
-        source_uri,
-        symbol_from_path=symbol_from_path,
-    )
-    con.execute(
-        f"""
-        COPY (
-            {select_sql}
-        ) TO '{sql_literal(str(local_path))}' (FORMAT PARQUET, COMPRESSION SNAPPY);
-        """
-    )
+    frames = []
+    for pf in parquet_files:
+        df = pd.read_parquet(pf)
+        if symbol_from_path:
+            # Extract symbol from parent directory name or filename stem
+            # Expected structure: <dir>/<symbol>/.../<file>.parquet
+            # or <dir>/<symbol>-<interval>.parquet
+            parts = pf.relative_to(input_path).parts
+            if len(parts) >= 2:
+                symbol = parts[0]  # First directory component
+            else:
+                symbol = pf.stem.split("-")[0] if "-" in pf.stem else pf.stem
+            if "symbol" not in df.columns:
+                df["symbol"] = symbol
+            else:
+                # Fill empty symbol values from path
+                mask = df["symbol"].isna() | (df["symbol"] == "")
+                df.loc[mask, "symbol"] = symbol
+        frames.append(df)
 
+    merged = pd.concat(frames, ignore_index=True)
+    print(f"合并完成: {len(merged)} 行")
 
-def is_gateway_timeout(exc: BaseException) -> bool:
-    if isinstance(exc, ClientError):
-        code = str(exc.response.get("Error", {}).get("Code", ""))
-        status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
-        return code == "524" or status == 524
-    return "524" in str(exc)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    merged.to_parquet(output_path, compression="snappy", index=False)
+    size_mb = output_path.stat().st_size / (1024 * 1024)
+    print(f"写入: {output_path} ({size_mb:.1f} MB)")
 
-
-def upload_multipart(
-    *,
-    local_path: Path,
-    endpoint: str,
-    access_key: str,
-    secret_key: str,
-    region: str,
-    bucket: str,
-    key: str,
-    chunk_size: int,
-    max_concurrency: int,
-    max_retries: int,
-) -> None:
-    client = boto3.client(
-        "s3",
-        endpoint_url=parse_boto_endpoint(endpoint),
-        aws_access_key_id=access_key,
-        aws_secret_access_key=secret_key,
-        region_name=region,
-        config=Config(
-            s3={"addressing_style": "path"},
-            retries={"max_attempts": 10, "mode": "adaptive"},
-            connect_timeout=60,
-            read_timeout=300,
-        ),
-    )
-    transfer_config = TransferConfig(
-        multipart_threshold=8 * 1024 * 1024,
-        multipart_chunksize=chunk_size,
-        max_concurrency=max_concurrency,
-        use_threads=max_concurrency > 1,
-    )
-
-    size_mb = local_path.stat().st_size / (1024 * 1024)
-    object_key = key.lstrip("/")
-    print(
-        f"分段上传: s3://{bucket}/{object_key} "
-        f"({size_mb:.1f} MB, chunk={chunk_size // (1024 * 1024)}MB, "
-        f"concurrency={max_concurrency})"
-    )
-
-    for attempt in range(1, max_retries + 1):
-        try:
-            upload_started = time.monotonic()
-            client.upload_file(
-                str(local_path),
-                bucket,
-                object_key,
-                Config=transfer_config,
-            )
-            upload_seconds = time.monotonic() - upload_started
-            print(f"上传完成，耗时 {upload_seconds:.1f}s")
-            return
-        except (S3UploadFailedError, ClientError) as exc:
-            if not is_gateway_timeout(exc) or attempt == max_retries:
-                raise
-            wait_seconds = min(60, 2**attempt)
-            print(
-                f"网关超时 (attempt {attempt}/{max_retries}): {exc}; "
-                f"{wait_seconds}s 后重试..."
-            )
-            time.sleep(wait_seconds)
-
-
-def inspect_source(
-    con: duckdb.DuckDBPyConnection,
-    source_uri: str,
-    *,
-    symbol_from_path: bool,
-) -> None:
-    file_count = con.execute(
-        f"SELECT count(*) FROM glob('{sql_literal(source_uri)}');"
-    ).fetchone()[0]
-    select_sql = build_merge_select_sql(
-        con,
-        source_uri,
-        symbol_from_path=symbol_from_path,
-    )
-    row_count = con.execute(f"SELECT count(*) FROM ({select_sql}) AS merged;").fetchone()[0]
-    print(f"匹配文件数: {file_count}")
-    print(f"总行数: {row_count}")
-    if symbol_from_path:
-        symbol_count = con.execute(
-            f"SELECT count(DISTINCT symbol) FROM ({select_sql}) AS merged "
-            "WHERE symbol IS NOT NULL AND symbol <> '';"
-        ).fetchone()[0]
-        empty_symbol_count = con.execute(
-            f"SELECT count(*) FROM ({select_sql}) AS merged "
-            "WHERE symbol IS NULL OR symbol = '';"
-        ).fetchone()[0]
-        print(f"symbol 列: 从文件路径提取，distinct={symbol_count}")
-        if empty_symbol_count:
-            print(f"警告: 有 {empty_symbol_count} 行未能解析 symbol")
+    return len(merged)
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="合并 MinIO 上的 Parquet 文件")
+    parser = argparse.ArgumentParser(description="合并本地 Parquet 文件并执行异常值检测")
     parser.add_argument(
-        "--dry-run",
+        "--input-dir",
+        default=os.environ.get("INPUT_DIR", "./data/raw"),
+        help="包含待合并 parquet 文件的本地目录",
+    )
+    parser.add_argument(
+        "--output-path",
+        default=os.environ.get("OUTPUT_PATH", "./data/merged/output.parquet"),
+        help="合并后输出文件路径",
+    )
+    parser.add_argument(
+        "--skip-outlier-detection",
         action="store_true",
-        help="仅统计匹配文件数和行数，不执行合并",
+        default=False,
+        help="跳过异常值检测步骤",
     )
     parser.add_argument(
-        "--temp-directory",
-        default=os.environ.get("DUCKDB_TEMP_DIRECTORY", "/tmp/duckdb"),
-        help="DuckDB 临时目录，用于磁盘溢写",
+        "--price-jump-threshold",
+        type=float,
+        default=float(os.environ.get("PRICE_JUMP_THRESHOLD", "0.10")),
+        help="价格跳变阈值（默认 0.10 即 10%%）",
     )
     parser.add_argument(
-        "--memory-limit",
-        default=os.environ.get("DUCKDB_MEMORY_LIMIT", "4GB"),
-        help="DuckDB 内存上限，超出部分落盘",
-    )
-    parser.add_argument(
-        "--multipart-chunk-size",
+        "--interval-ms",
         type=int,
-        default=int(os.environ.get("MULTIPART_CHUNK_SIZE", str(8 * 1024 * 1024))),
-        help="S3 分段上传每段大小（字节），默认 8MB",
-    )
-    parser.add_argument(
-        "--multipart-concurrency",
-        type=int,
-        default=int(os.environ.get("MULTIPART_CONCURRENCY", "2")),
-        help="S3 分段上传并发数，默认 2",
-    )
-    parser.add_argument(
-        "--upload-max-retries",
-        type=int,
-        default=int(os.environ.get("UPLOAD_MAX_RETRIES", "5")),
-        help="网关超时后的整次上传重试次数，默认 5",
+        default=int(os.environ.get("INTERVAL_MS", "3600000")),
+        help="K线间隔毫秒数（默认 3600000 即 1h）",
     )
     symbol_from_path_default = os.environ.get("SYMBOL_FROM_PATH", "true").strip().lower() in {
-        "1",
-        "true",
-        "yes",
+        "1", "true", "yes",
     }
     parser.add_argument(
         "--symbol-from-path",
         dest="symbol_from_path",
         action="store_true",
         default=symbol_from_path_default,
-        help="从 Parquet 文件路径提取 symbol 列（默认开启）",
+        help="从文件路径提取 symbol 列（默认开启）",
     )
     parser.add_argument(
         "--no-symbol-from-path",
         dest="symbol_from_path",
         action="store_false",
-        help="不提取 symbol，仅合并原始列",
+        help="不从路径提取 symbol",
     )
     publish_default = os.environ.get("PUBLISH_TO_KAGGLE", "").strip().lower() in {
-        "1",
-        "true",
-        "yes",
+        "1", "true", "yes",
     }
     parser.add_argument(
         "--publish-to-kaggle",
         action="store_true",
         default=publish_default,
-        help="合并并上传 MinIO 后，直接发布到 Kaggle（复用本地文件，无需二次下载）",
+        help="合并后发布到 Kaggle",
     )
     parser.add_argument(
         "--no-publish-to-kaggle",
         dest="publish_to_kaggle",
         action="store_false",
-        help="仅合并并写回 MinIO，不上传 Kaggle",
+        help="仅合并，不上传 Kaggle",
     )
     parser.add_argument(
         "--kaggle-staging-dir",
@@ -354,112 +170,94 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    endpoint = require_env("MINIO_ENDPOINT")
-    access_key = require_env("MINIO_ACCESS_KEY")
-    secret_key = require_env("MINIO_SECRET_KEY")
-    region = os.environ.get("MINIO_REGION", "us-east-1").strip() or "us-east-1"
-    input_bucket = require_env("INPUT_BUCKET")
-    output_bucket = os.environ.get("OUTPUT_BUCKET", input_bucket).strip() or input_bucket
-    input_glob = require_env("INPUT_GLOB")
-    output_path = require_env("OUTPUT_PATH")
+    output_path = Path(args.output_path)
 
-    source_uri = build_s3_uri(input_bucket, input_glob)
-    dest_uri = build_s3_uri(output_bucket, output_path)
-    local_output = Path(args.temp_directory) / Path(output_path).name
+    # Step 1: Merge local parquets
+    print(f"=== 步骤 1: 合并本地 Parquet ===")
+    print(f"输入目录: {args.input_dir}")
+    print(f"输出文件: {output_path}")
+    print(f"symbol 提取: {'开启' if args.symbol_from_path else '关闭'}")
 
-    Path(args.temp_directory).mkdir(parents=True, exist_ok=True)
-
-    con = duckdb.connect()
-    configure_s3(
-        con,
-        endpoint=endpoint,
-        access_key=access_key,
-        secret_key=secret_key,
-        region=region,
+    merge_started = time.monotonic()
+    total_rows = merge_local_parquets(
+        args.input_dir,
+        output_path,
+        symbol_from_path=args.symbol_from_path,
     )
+    merge_seconds = time.monotonic() - merge_started
+    print(f"合并耗时: {merge_seconds:.1f}s\n")
 
-    print(f"输入: {source_uri}")
-    print(f"symbol 提取: {'开启（从路径）' if args.symbol_from_path else '关闭'}")
-    if args.dry_run:
-        inspect_source(con, source_uri, symbol_from_path=args.symbol_from_path)
-        print("dry-run 完成，未写入输出文件")
-        return
+    # Step 2: Outlier detection
+    if not args.skip_outlier_detection:
+        print(f"=== 步骤 2: 异常值检测 ===")
+        print(f"价格跳变阈值: {args.price_jump_threshold:.0%}")
+        print(f"K线间隔: {args.interval_ms}ms")
 
-    print(f"输出: {dest_uri}")
-    print(f"本地临时文件: {local_output}")
-    try:
-        merge_started = time.monotonic()
-        merge_to_local(
-            con,
-            source_uri=source_uri,
-            local_path=local_output,
-            temp_directory=args.temp_directory,
-            memory_limit=args.memory_limit,
-            symbol_from_path=args.symbol_from_path,
+        outlier_started = time.monotonic()
+        df = pd.read_parquet(output_path)
+        cleaned_df, report = clean_kline_outliers(
+            df,
+            price_jump_threshold=args.price_jump_threshold,
+            interval_ms=args.interval_ms,
         )
-        merge_seconds = time.monotonic() - merge_started
-        size_mb = local_output.stat().st_size / (1024 * 1024)
-        print(f"合并完成，耗时 {merge_seconds:.1f}s，文件大小 {size_mb:.1f} MB")
-        upload_multipart(
-            local_path=local_output,
-            endpoint=endpoint,
-            access_key=access_key,
-            secret_key=secret_key,
-            region=region,
-            bucket=output_bucket,
-            key=output_path,
-            chunk_size=args.multipart_chunk_size,
-            max_concurrency=args.multipart_concurrency,
-            max_retries=args.upload_max_retries,
-        )
+        print(report.summary())
 
-        if args.publish_to_kaggle:
-            dataset_slug = os.environ.get("KAGGLE_DATASET", "").strip()
-            if not dataset_slug:
-                print("缺少 KAGGLE_DATASET，无法发布到 Kaggle", file=sys.stderr)
-                sys.exit(1)
+        # Write cleaned data back
+        cleaned_df.to_parquet(output_path, compression="snappy", index=False)
+        size_mb = output_path.stat().st_size / (1024 * 1024)
+        outlier_seconds = time.monotonic() - outlier_started
+        print(f"清洗后文件大小: {size_mb:.1f} MB")
+        print(f"异常值检测耗时: {outlier_seconds:.1f}s\n")
+    else:
+        print("=== 步骤 2: 异常值检测 (已跳过) ===\n")
 
-            version_notes = os.environ.get(
-                "VERSION_NOTES",
-                "Merged parquet with symbol column from file path",
-            ).strip()
-            dataset_title = os.environ.get(
-                "KAGGLE_DATASET_TITLE",
-                dataset_slug.split("/", 1)[-1].replace("-", " ").title(),
-            ).strip()
-            license_name = os.environ.get("KAGGLE_LICENSE", "CC0-1.0").strip() or "CC0-1.0"
+    # Step 3: Upload to Kaggle
+    if args.publish_to_kaggle:
+        print(f"=== 步骤 3: 上传 Kaggle ===")
+        dataset_slug = os.environ.get("KAGGLE_DATASET", "").strip()
+        if not dataset_slug:
+            print("缺少 KAGGLE_DATASET，无法发布到 Kaggle", file=sys.stderr)
+            sys.exit(1)
 
-            configure_kaggle_auth()
+        version_notes = os.environ.get(
+            "VERSION_NOTES",
+            "Merged parquet with outlier detection",
+        ).strip()
+        dataset_title = os.environ.get(
+            "KAGGLE_DATASET_TITLE",
+            dataset_slug.split("/", 1)[-1].replace("-", " ").title(),
+        ).strip()
+        license_name = os.environ.get("KAGGLE_LICENSE", "CC0-1.0").strip() or "CC0-1.0"
 
-            staging_dir = Path(args.kaggle_staging_dir)
-            if staging_dir.exists():
-                shutil.rmtree(staging_dir)
-            staging_dir.mkdir(parents=True, exist_ok=True)
-            staged_file = staging_dir / output_path.lstrip("/")
-            staged_file.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(local_output, staged_file)
-            print(f"Kaggle 暂存: {staged_file}")
+        configure_kaggle_auth()
 
-            publish_started = time.monotonic()
-            publish_staging_dir(
-                staging_dir,
-                dataset_slug=dataset_slug,
-                version_notes=version_notes,
-                dataset_title=dataset_title,
-                license_name=license_name,
-                create_new=args.kaggle_create_new,
-                dir_mode=args.kaggle_dir_mode,
-                public=args.kaggle_public,
-            )
-            publish_seconds = time.monotonic() - publish_started
-            print(f"Kaggle 发布完成，耗时 {publish_seconds:.1f}s")
-
+        staging_dir = Path(args.kaggle_staging_dir)
+        if staging_dir.exists():
             shutil.rmtree(staging_dir)
-            print(f"已清理 Kaggle 暂存目录: {staging_dir}")
-    finally:
-        if local_output.exists():
-            local_output.unlink()
-            print(f"已删除本地临时文件: {local_output}")
+        staging_dir.mkdir(parents=True, exist_ok=True)
+
+        staged_file = staging_dir / output_path.name
+        shutil.copy2(output_path, staged_file)
+        print(f"Kaggle 暂存: {staged_file}")
+
+        publish_started = time.monotonic()
+        publish_staging_dir(
+            staging_dir,
+            dataset_slug=dataset_slug,
+            version_notes=version_notes,
+            dataset_title=dataset_title,
+            license_name=license_name,
+            create_new=args.kaggle_create_new,
+            dir_mode=args.kaggle_dir_mode,
+            public=args.kaggle_public,
+        )
+        publish_seconds = time.monotonic() - publish_started
+        print(f"Kaggle 发布完成，耗时 {publish_seconds:.1f}s")
+
+        shutil.rmtree(staging_dir)
+        print(f"已清理 Kaggle 暂存目录: {staging_dir}\n")
+    else:
+        print("=== 步骤 3: 上传 Kaggle (已跳过) ===\n")
 
     print("管道任务完成")
 
