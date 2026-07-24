@@ -3,10 +3,10 @@
 
 针对合约1h K线数据的量化因子标准异常值处理：
 - OHLC一致性校验（自动修正）
-- 价格跳变检测（标记）
+- 价格跳变检测（标记，按 symbol 分组计算）
 - 成交量异常（标记）
-- 时间戳连续性检查（标记）
-- 重复时间戳去重
+- 时间戳连续性检查（标记，按 symbol 分组计算）
+- 重复时间戳去重（按 symbol + open_time 联合键）
 """
 
 from __future__ import annotations
@@ -59,7 +59,10 @@ class OutlierReport:
 
 
 def _fix_ohlc_consistency(df: pd.DataFrame, report: OutlierReport) -> pd.DataFrame:
-    """修正OHLC一致性：确保 high>=low, high>=open/close, low<=open/close。"""
+    """修正OHLC一致性：确保 high>=low, high>=open/close, low<=open/close。
+
+    同时从原始四价计算 corrected_high 和 corrected_low，避免级联覆盖风险。
+    """
     df = df.copy()
 
     mask_high_lt_low = df["high"] < df["low"]
@@ -77,35 +80,38 @@ def _fix_ohlc_consistency(df: pd.DataFrame, report: OutlierReport) -> pd.DataFra
     if report.ohlc_inconsistent_count == 0:
         return df
 
-    corrected = 0
+    # Compute corrected values from original four prices simultaneously
+    # to avoid cascade overwrite issues
+    ohlc_cols = ["open", "high", "low", "close"]
+    corrected_high = df.loc[inconsistent_mask, ohlc_cols].max(axis=1)
+    corrected_low = df.loc[inconsistent_mask, ohlc_cols].min(axis=1)
 
-    needs_high_fix = mask_high_lt_low | mask_high_lt_open | mask_high_lt_close
-    if needs_high_fix.any():
-        df.loc[needs_high_fix, "high"] = df.loc[needs_high_fix][["open", "high", "close", "low"]].max(axis=1)
-        corrected += int(needs_high_fix.sum())
+    df.loc[inconsistent_mask, "high"] = corrected_high
+    df.loc[inconsistent_mask, "low"] = corrected_low
 
-    needs_low_fix = mask_low_gt_open | mask_low_gt_close
-    if needs_low_fix.any():
-        df.loc[needs_low_fix, "low"] = df.loc[needs_low_fix][["open", "low", "close", "high"]].min(axis=1)
-        corrected += int(needs_low_fix.sum())
-
-    report.ohlc_corrected_count = corrected
-    logger.info(f"OHLC修正: {corrected} 行")
+    report.ohlc_corrected_count = int(inconsistent_mask.sum())
+    logger.info(f"OHLC修正: {report.ohlc_corrected_count} 行")
     return df
 
 
 def _detect_price_jumps(
     df: pd.DataFrame, report: OutlierReport, threshold: float = 0.10
 ) -> pd.DataFrame:
-    """检测相邻时间点价格变化超阈值的行（标记但不删除）。"""
+    """检测相邻时间点价格变化超阈值的行（标记但不删除）。
+
+    按 symbol 分组计算 pct_change，避免跨 symbol 边界产生虚假跳变。
+    """
     df = df.copy()
 
     if len(df) < 2:
+        df["_price_jump"] = 0
         return df
 
-    df = df.sort_values("open_time").reset_index(drop=True)
+    # Sort within each symbol group by open_time
+    df = df.sort_values(["symbol", "open_time"]).reset_index(drop=True)
 
-    price_change = df["close"].pct_change().abs()
+    # Per-symbol pct_change to avoid cross-symbol false jumps
+    price_change = df.groupby("symbol", sort=False)["close"].pct_change().abs()
     jump_mask = price_change > threshold
     jump_mask = jump_mask.fillna(False)
 
@@ -157,15 +163,20 @@ def _detect_volume_anomalies(df: pd.DataFrame, report: OutlierReport) -> pd.Data
 def _check_timestamp_continuity(
     df: pd.DataFrame, report: OutlierReport, interval_ms: int = 3600000
 ) -> pd.DataFrame:
-    """检测缺失的时间点（1h = 3600000ms）。"""
+    """检测缺失的时间点（1h = 3600000ms）。
+
+    按 symbol 分组检测时间间隔，避免跨 symbol 边界的虚假 gap。
+    """
     df = df.copy()
 
     if len(df) < 2:
+        df["_gap_after"] = 0
         return df
 
-    df = df.sort_values("open_time").reset_index(drop=True)
+    df = df.sort_values(["symbol", "open_time"]).reset_index(drop=True)
 
-    time_diffs = df["open_time"].diff()
+    # Per-symbol time diff
+    time_diffs = df.groupby("symbol", sort=False)["open_time"].diff()
     expected_diff = interval_ms
 
     gap_mask = time_diffs > expected_diff
@@ -175,9 +186,13 @@ def _check_timestamp_continuity(
     missing_timestamps = []
 
     for idx in df.index[gap_mask]:
-        prev_time = df.loc[idx - 1, "open_time"] if idx > 0 else None
+        curr_symbol = df.loc[idx, "symbol"]
         curr_time = df.loc[idx, "open_time"]
-        if prev_time is not None:
+        # Find previous row with same symbol
+        prev_rows = df.loc[:idx - 1]
+        prev_same = prev_rows[prev_rows["symbol"] == curr_symbol]
+        if len(prev_same) > 0:
+            prev_time = prev_same.iloc[-1]["open_time"]
             gap_size = curr_time - prev_time
             n_missing = int(gap_size // expected_diff) - 1
             if n_missing > 0:
@@ -190,13 +205,24 @@ def _check_timestamp_continuity(
     if missing_count > 0:
         logger.warning(f"检测到 {missing_count} 个缺失时间点")
 
+    df["_gap_after"] = gap_mask.astype(int)
     return df
 
 
 def _remove_duplicate_timestamps(df: pd.DataFrame, report: OutlierReport) -> pd.DataFrame:
-    """去除重复时间戳，保留第一条。"""
+    """去除重复时间戳，保留第一条。
+
+    使用 (symbol, open_time) 作为联合去重键，避免不同 symbol 相同时间戳被误删。
+    """
     before_count = len(df)
-    df = df.drop_duplicates(subset=["open_time"], keep="first").reset_index(drop=True)
+
+    # Use symbol + open_time as composite key for deduplication
+    if "symbol" in df.columns:
+        dedup_subset = ["symbol", "open_time"]
+    else:
+        dedup_subset = ["open_time"]
+
+    df = df.drop_duplicates(subset=dedup_subset, keep="first").reset_index(drop=True)
     after_count = len(df)
 
     report.duplicate_timestamp_count = before_count - after_count
@@ -223,6 +249,11 @@ def clean_kline_outliers(
 
     Returns:
         (清洗后DataFrame, OutlierReport)
+        返回的 DataFrame 会追加以下标记列:
+        - _price_jump: 价格跳变标记 (0/1)
+        - _zero_volume: 零成交量标记 (0/1)
+        - _extreme_volume: 极端放量标记 (0/1)
+        - _gap_after: 时间戳间断标记 (0/1)
     """
     report = OutlierReport(total_rows=len(df))
 

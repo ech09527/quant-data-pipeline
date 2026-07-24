@@ -36,7 +36,7 @@ jobs:
           import numpy as np
           from outlier_detection import clean_kline_outliers, OutlierReport
 
-          def make_base_df(n=20):
+          def make_base_df(n=20, symbol="BTCUSDT"):
               """Create base kline data with 1h intervals."""
               base_time = 1700000000000
               times = [base_time + i * 3600000 for i in range(n)]
@@ -53,7 +53,7 @@ jobs:
                   "taker_buy_base_volume": [500.0] * n,
                   "taker_buy_quote_volume": [50000.0] * n,
                   "ignore": [0] * n,
-                  "symbol": ["BTCUSDT"] * n,
+                  "symbol": [symbol] * n,
               })
 
           errors = []
@@ -150,6 +150,40 @@ jobs:
           if report.duplicate_timestamp_count != 0:
               errors.append(f"T8: clean data has {report.duplicate_timestamp_count} duplicates")
           print(f"  Clean data passed through with no issues")
+
+          # Test 9: Multi-symbol price jump isolation
+          print("Test 9: Multi-symbol price jump isolation...")
+          df_btc = make_base_df(10, symbol="BTCUSDT")
+          df_eth = make_base_df(10, symbol="ETHUSDT")
+          # ETH has stable prices, BTC has a jump at row 5
+          df_btc.loc[5, "close"] = 200.0  # jump within BTC
+          df_multi = pd.concat([df_btc, df_eth], ignore_index=True)
+          cleaned, report = clean_kline_outliers(df_multi)
+          # Should detect jumps only within BTC, NOT false jumps at symbol boundary
+          btc_jumps = cleaned[cleaned["symbol"] == "BTCUSDT"]["_price_jump"].sum()
+          eth_jumps = cleaned[cleaned["symbol"] == "ETHUSDT"]["_price_jump"].sum()
+          if btc_jumps < 1:
+              errors.append(f"T9: expected >=1 BTC price jumps, got {btc_jumps}")
+          if eth_jumps != 0:
+              errors.append(f"T9: expected 0 ETH price jumps (no cross-symbol false positives), got {eth_jumps}")
+          print(f"  BTC jumps: {btc_jumps}, ETH jumps: {eth_jumps} (cross-symbol isolation OK)")
+
+          # Test 10: Multi-symbol timestamp gap isolation
+          print("Test 10: Multi-symbol timestamp gap isolation...")
+          df_btc = make_base_df(10, symbol="BTCUSDT")
+          df_eth = make_base_df(10, symbol="ETHUSDT")
+          # Create gap only in BTC (remove rows 4-6)
+          df_btc = df_btc.drop([4, 5, 6]).reset_index(drop=True)
+          df_multi = pd.concat([df_btc, df_eth], ignore_index=True)
+          cleaned, report = clean_kline_outliers(df_multi)
+          # Gap should be detected in BTC only, not falsely at symbol boundary
+          btc_gaps = cleaned[cleaned["symbol"] == "BTCUSDT"]["_gap_after"].sum() if "_gap_after" in cleaned.columns else 0
+          eth_gaps = cleaned[cleaned["symbol"] == "ETHUSDT"]["_gap_after"].sum() if "_gap_after" in cleaned.columns else 0
+          if btc_gaps < 1:
+              errors.append(f"T10: expected >=1 BTC gaps, got {btc_gaps}")
+          if eth_gaps != 0:
+              errors.append(f"T10: expected 0 ETH gaps (no cross-symbol false gaps), got {eth_gaps}")
+          print(f"  BTC gaps: {btc_gaps}, ETH gaps: {eth_gaps} (cross-symbol isolation OK)")
 
           # Summary
           print("\n" + "="*50)

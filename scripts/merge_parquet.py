@@ -2,6 +2,7 @@
 """合并本地 Parquet 文件，执行异常值检测，并可选上传 Kaggle。
 
 数据流：本地读取已下载的 parquet → 合并 → 异常值处理 → 写本地 parquet → 上传 Kaggle
+优化：保持 DataFrame 在内存中传递，仅在最终输出时写盘一次。
 """
 
 from __future__ import annotations
@@ -33,14 +34,13 @@ def require_env(name: str) -> str:
 
 def merge_local_parquets(
     input_dir: str,
-    output_path: Path,
     *,
     symbol_from_path: bool = True,
-) -> int:
+) -> pd.DataFrame:
     """读取目录下所有 parquet 文件并合并为一个 DataFrame。
 
     Returns:
-        合并后的总行数
+        合并后的 DataFrame（保持在内存中，不写盘）
     """
     input_path = Path(input_dir)
     if not input_path.exists():
@@ -75,12 +75,7 @@ def merge_local_parquets(
     merged = pd.concat(frames, ignore_index=True)
     print(f"合并完成: {len(merged)} 行")
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    merged.to_parquet(output_path, compression="snappy", index=False)
-    size_mb = output_path.stat().st_size / (1024 * 1024)
-    print(f"写入: {output_path} ({size_mb:.1f} MB)")
-
-    return len(merged)
+    return merged
 
 
 def main() -> None:
@@ -172,44 +167,59 @@ def main() -> None:
 
     output_path = Path(args.output_path)
 
-    # Step 1: Merge local parquets
+    # Step 1: Merge local parquets (keep in memory)
     print(f"=== 步骤 1: 合并本地 Parquet ===")
     print(f"输入目录: {args.input_dir}")
     print(f"输出文件: {output_path}")
     print(f"symbol 提取: {'开启' if args.symbol_from_path else '关闭'}")
 
     merge_started = time.monotonic()
-    total_rows = merge_local_parquets(
+    merged_df = merge_local_parquets(
         args.input_dir,
-        output_path,
         symbol_from_path=args.symbol_from_path,
     )
+    total_rows = len(merged_df)
     merge_seconds = time.monotonic() - merge_started
     print(f"合并耗时: {merge_seconds:.1f}s\n")
 
-    # Step 2: Outlier detection
+    # Step 2: Outlier detection (in-memory pipeline)
     if not args.skip_outlier_detection:
         print(f"=== 步骤 2: 异常值检测 ===")
         print(f"价格跳变阈值: {args.price_jump_threshold:.0%}")
         print(f"K线间隔: {args.interval_ms}ms")
 
         outlier_started = time.monotonic()
-        df = pd.read_parquet(output_path)
         cleaned_df, report = clean_kline_outliers(
-            df,
+            merged_df,
             price_jump_threshold=args.price_jump_threshold,
             interval_ms=args.interval_ms,
         )
         print(report.summary())
 
-        # Write cleaned data back
-        cleaned_df.to_parquet(output_path, compression="snappy", index=False)
-        size_mb = output_path.stat().st_size / (1024 * 1024)
+        # Sanity check: warn if cleaned_df is empty or row count dropped >50%
+        if len(cleaned_df) == 0:
+            print("ERROR: 清洗后 DataFrame 为空，请检查输入数据和异常检测参数", file=sys.stderr)
+            sys.exit(1)
+        drop_ratio = 1.0 - len(cleaned_df) / total_rows if total_rows > 0 else 0.0
+        if drop_ratio > 0.50:
+            print(
+                f"ERROR: 清洗后行数骤降 {drop_ratio:.1%} ({total_rows} → {len(cleaned_df)})，"
+                f"请检查输入数据和异常检测参数",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
         outlier_seconds = time.monotonic() - outlier_started
-        print(f"清洗后文件大小: {size_mb:.1f} MB")
         print(f"异常值检测耗时: {outlier_seconds:.1f}s\n")
     else:
         print("=== 步骤 2: 异常值检测 (已跳过) ===\n")
+        cleaned_df = merged_df
+
+    # Write once at the end (single I/O)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    cleaned_df.to_parquet(output_path, compression="snappy", index=False)
+    size_mb = output_path.stat().st_size / (1024 * 1024)
+    print(f"写入: {output_path} ({size_mb:.1f} MB, {len(cleaned_df)} 行)")
 
     # Step 3: Upload to Kaggle
     if args.publish_to_kaggle:
