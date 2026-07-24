@@ -7,30 +7,47 @@ on:
       - '.github/workflows/quant-data-pipeline.yml'
       - 'scripts/**'
       - 'requirements.txt'
+  schedule:
+    # Every Monday 03:30 UTC, aligned with funding-rate pipeline
+    - cron: '30 3 * * 1'
   workflow_dispatch:
     inputs:
-      input_glob:
-        description: '输入对象 key 通配符，如 binance/futures/um/klines/1h/**/*.parquet'
-        required: true
-        type: string
-        default: 'binance/futures/um/klines/1h/**/*.parquet'
-      output_path:
-        description: '输出对象路径，如 binance/futures/um/klines/1h.parquet'
-        required: true
-        type: string
-        default: 'binance/futures/um/klines/1h.parquet'
-      memory_limit:
-        description: 'DuckDB 内存上限，超出部分自动落盘'
+      symbols:
+        description: '交易对列表(逗号分隔，留空=全部USDT永续)'
         required: false
         type: string
-        default: '4GB'
-      symbol_from_path:
-        description: '从文件路径提取 symbol 列（per-symbol 目录结构建议开启）'
+        default: ''
+      interval:
+        description: 'K线周期'
+        required: false
+        type: choice
+        options:
+          - 1h
+          - 4h
+          - 1d
+        default: '1h'
+      start_month:
+        description: '起始月份 YYYY-MM(留空=按交易对上线时间)'
+        required: false
+        type: string
+        default: ''
+      end_month:
+        description: '结束月份 YYYY-MM(留空=上一个完整月)'
+        required: false
+        type: string
+        default: ''
+      max_workers:
+        description: '下载并发数'
+        required: false
+        type: string
+        default: '8'
+      skip_existing:
+        description: '跳过已存在的Parquet文件'
         required: false
         type: boolean
         default: true
       publish_to_kaggle:
-        description: '合并完成后发布到 Kaggle（复用本地文件，无需二次下载）'
+        description: '合并完成后发布到 Kaggle'
         required: false
         type: boolean
         default: true
@@ -43,18 +60,51 @@ on:
         description: 'Kaggle 版本说明'
         required: false
         type: string
-        default: 'Merged parquet with symbol column from file path'
-      kaggle_dir_mode:
-        description: 'Kaggle 上传打包方式'
-        required: false
-        type: choice
-        options:
-          - zip
-          - tar
-        default: zip
+        default: 'Weekly kline data update'
 
 jobs:
-  pipeline:
+  download:
+    runs-on: ubuntu-latest
+    outputs:
+      output_dir: ${{ steps.download.outputs.output_dir }}
+      parquet_count: ${{ steps.download.outputs.parquet_count }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Download Binance Vision klines
+        id: download
+        env:
+          FAPI_HTTP_PROXY: ${{ secrets.FAPI_HTTP_PROXY }}
+          VISION_HTTP_PROXY: ${{ secrets.VISION_HTTP_PROXY }}
+          SYMBOLS: ${{ github.event.inputs.symbols || '' }}
+          INTERVAL: ${{ github.event.inputs.interval || '1h' }}
+          START_MONTH: ${{ github.event.inputs.start_month || '' }}
+          END_MONTH: ${{ github.event.inputs.end_month || '' }}
+          MAX_WORKERS: ${{ github.event.inputs.max_workers || '8' }}
+          SKIP_EXISTING: ${{ github.event.inputs.skip_existing != false && 'true' || 'false' }}
+          OUTPUT_DIR: /tmp/binance-klines
+        run: |
+          python scripts/download_binance_vision.py
+          echo "output_dir=/tmp/binance-klines" >> "$GITHUB_OUTPUT"
+          echo "parquet_count=$(find /tmp/binance-klines -name '*.parquet' | wc -l)" >> "$GITHUB_OUTPUT"
+
+      - name: Upload klines artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: binance-klines-parquet
+          path: /tmp/binance-klines/**/*.parquet
+          retention-days: 3
+
+  merge-and-publish:
+    needs: download
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -67,28 +117,22 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Merge, upload to MinIO, and publish to Kaggle
+      - name: Download klines artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: binance-klines-parquet
+          path: /tmp/binance-klines
+
+      - name: Merge, detect outliers, and publish to Kaggle
         env:
-          MINIO_ENDPOINT: ${{ secrets.MINIO_ENDPOINT }}
-          MINIO_ACCESS_KEY: ${{ secrets.MINIO_ACCESS_KEY }}
-          MINIO_SECRET_KEY: ${{ secrets.MINIO_SECRET_KEY }}
-          MINIO_REGION: ${{ secrets.MINIO_REGION }}
-          INPUT_BUCKET: ${{ secrets.INPUT_BUCKET }}
-          OUTPUT_BUCKET: ${{ secrets.OUTPUT_BUCKET }}
-          INPUT_GLOB: ${{ github.event.inputs.input_glob || 'binance/futures/um/klines/1h/**/*.parquet' }}
-          OUTPUT_PATH: ${{ github.event.inputs.output_path || 'binance/futures/um/klines/1h.parquet' }}
-          DUCKDB_MEMORY_LIMIT: ${{ github.event.inputs.memory_limit || '4GB' }}
-          DUCKDB_TEMP_DIRECTORY: /tmp/duckdb
-          MULTIPART_CHUNK_SIZE: '8388608'
-          MULTIPART_CONCURRENCY: '2'
-          UPLOAD_MAX_RETRIES: '5'
-          SYMBOL_FROM_PATH: ${{ github.event.inputs.symbol_from_path != false && 'true' || 'false' }}
-          PUBLISH_TO_KAGGLE: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.publish_to_kaggle != false && 'true' || 'false' }}
+          INPUT_GLOB: '/tmp/binance-klines/**/*.parquet'
+          OUTPUT_PATH: '/tmp/merged/klines.parquet'
+          PUBLISH_TO_KAGGLE: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.publish_to_kaggle != false) || github.event_name == 'schedule' }}
           KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
           KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
           KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
           KAGGLE_DATASET: ${{ github.event.inputs.kaggle_dataset || 'yhydev97/quant-data' }}
-          VERSION_NOTES: ${{ github.event.inputs.version_notes || 'Merged parquet with symbol column from file path' }}
+          VERSION_NOTES: ${{ github.event.inputs.version_notes || 'Weekly kline data update' }}
           KAGGLE_STAGING_DIR: /tmp/kaggle-staging
-          KAGGLE_DIR_MODE: ${{ github.event.inputs.kaggle_dir_mode || 'zip' }}
+          KAGGLE_DIR_MODE: zip
         run: python scripts/merge_parquet.py
